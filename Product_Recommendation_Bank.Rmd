@@ -1,0 +1,759 @@
+---
+title: "Product Recommendations for Customers of a Bank"
+author: "Shreya Ghelani"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## Global Options
+library(knitr)
+opts_chunk$set(echo=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE
+               )
+```
+
+#### Packages and Themes Used
+```{r message=FALSE, warning=FALSE} 
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(stringr)
+library(arules)
+library(rattle)
+library(mlr)
+library(randomForestSRC)
+library(rFerns)
+library(neuralnet)
+
+my_theme <- theme_bw() +
+theme(axis.title=element_text(size=14),
+plot.title=element_text(size=20),
+axis.text =element_text(size=8))
+
+my_theme_dark <- theme_dark() +
+theme(axis.title=element_text(size=24),
+plot.title=element_text(size=36),
+axis.text =element_text(size=16))
+
+```
+
+
+## Introduction
+
+Today every industry is making use of recommender systems and predictive modeling with their own tailored versions. Banking is no different. The number of services and products that banks offer today to their customers have increased significantly in recent times. Recommendation systems are an approach towards personalization of banking services using prediction of anticipated customer purchasing behavior. 
+In a world strife with competition that is only a click away, offering your customers products and services best matched to their needs and preferences can go a long way towards gaining customer loyalty thereby making it a key business strategy. Predicting customer purchase behavior and recommending personalized products that have a high propensity of purchase can also prove to be a cost-effective strategy through targeted marketing. Customers are increasingly overwhelmed by marketing messages from web sites, emails, mobile apps, etc. Besides cost effectiveness for the organization, recommender systems also overcome the challenge of cutting through the noise and predict what customers are most likely to buy and make effective and useful recommendations. 
+Banks and financial institutions have always collected huge amounts of data, predominantly on customer profiles, investments, transactions, products and recently logs website clicks and app usage. This data is a gold mine to tap into for analytical use-cases and making intelligent decisions across marketing, risk management and operations. 
+
+## Data Source 
+The data for this analysis comes from Santander Bank which is a wholly owned subsidiary of the Spanish Santander Group. It is based in Boston and its principal market is the northeast United States. It offers products and services that cater to individual customers, Small and Medium Enterprises, institutions, students, non-profit and non-governmental organizations, etc. Under their current system, a small number of Santander Bank customers receive many recommendations while many others rarely see any, resulting in an uneven customer experience. The Bank wants to predict potential products that their new customers will use based on the product purchase and usage behavior of other similar customers. With a more effective recommendation system in place, the bank can better meet the individual demands of its customers.
+Santander Bank provided this data to Kaggle which turned this problem into a Data Science Challenge. The bank has provided data about 1 lac customers. This data includes demographic information about the customer and a snapshot of his product purchase behavior for one month. Based on this data we predict the products a set of 10,000 new customers are likely to purchase in the next month. A customer can own/purchase more than one product which makes this a multi-label classification problem.
+Features include age, sex, seniority, country and province of residence, customer segment etc.  and the response variables are a set of 24 products that a customer either owns or does not own. The list of features and the description of the columns is provided in the Appendix section.
+
+
+```{r}
+data <- read.csv("train_data.csv")
+test_data <- read.csv("test_data.csv")
+data <- data[-c(1)]
+test_data <- test_data[-c(1)]
+#data_copy <- data
+#test_data_copy <- test_data
+
+```
+
+## Data Preparation
+
+A couple of steps were performed to clean/prepare the data for further analysis. These include missing value treatments, character-value sanitization, data consolidation and splitting etc. The following steps were performed in particular -
+
+1. Converting the Date Variable to its correct format
+```{r message=FALSE, warning=FALSE}
+data$fecha_alta <- ymd(data$fecha_alta)
+test_data$fecha_alta <- ymd(test_data$fecha_alta)
+```
+
+2. Missing Data Analysis
+```{r}
+prod_cols <- colnames(data[str_detect( colnames(data),"_ult1")])
+all_cols <- colnames(data)
+user_cols <- colnames(data[ ! all_cols %in% prod_cols])
+data_missing_columns <- names(data)[which(sapply(data, function(x) any(is.na(x))))]
+missing_data <- sapply(data[,data_missing_columns], function(x) sum(is.na(x)))
+#kable(missing_data)
+missing_data_pct <- sapply(data[,data_missing_columns], function(x) round(sum(is.na(x))/dim(data)[1],5))
+complete_cases_pct <- dim(data[complete.cases(data[user_cols]),])[1]/dim(data[user_cols])[1]*100 
+```
+
+3. Feature Elimination
+
+The variables "ult_fec_cli_1t" (Last date as primary customer) and "conyuemp" (spouse index) are extremely sparse with more than 99% of the data missing. So, these two columns are dropped. Also, the columns "tipodom" (address type), "cod_prov" (province code) and "segment" (customer segment) do not provide any meaningful additional information since we are already capturing the country and province information for customers. We discard these columns. The dimensionality of the data (feature space)  is reduced by discarding seemingly unimportant customer information like "indrel_1mes" (Customer type at the beginning of the month), "indext" (foreigner index) and "indfall" (deceased index) since these variables do not impact the product purchasing behavior of customers significantly.
+```{r}
+data <- data[, !(colnames(data) %in% c("conyuemp","ult_fec_cli_1t"))]
+data <- data[, !(colnames(data) %in% c("tipodom","cod_prov"))]
+data <- data[,!names(data) %in% c("indrel_1mes","indext","indfall")]
+
+test_data <- test_data[, !(colnames(test_data) %in% c("conyuemp","ult_fec_cli_1t"))]
+test_data <- test_data[, !(colnames(test_data) %in% c("tipodom","cod_prov"))]
+test_data <- test_data[,!names(test_data) %in% c("indrel_1mes","indext","indfall")]
+
+data$year_alta <- year(data$fecha_alta)
+data$month_alta <- month(data$fecha_alta,label=T)
+test_data$year_alta <- year(test_data$fecha_alta)
+test_data$month_alta <- month(test_data$fecha_alta,label=T)
+
+```
+
+4. Missing Value Imputation
+Missing values for the columns "sexo" (Sex), "canal_entrada" (channel of entry) and "nomprov" (province name) are assigned the value "UNKNOWN".
+Missing values for the column "tiprel_1mes" (Customer relation type at the beginning of the month) are assigned the value "A" since that is the majority status (active).
+
+
+```{r}
+data$nomprov <- as.character(data$nomprov)
+data$nomprov[is.na(data$nomprov)] <- "UNKNOWN"
+data$canal_entrada <- as.character(data$canal_entrada)
+data$canal_entrada[is.na(data$canal_entrada)] <- "UNKNOWN"
+data$sexo <- as.character(data$sexo)
+data$sexo[is.na(data$sexo)] <- "UNKNOWN"
+data$ind_nomina_ult1[is.na(data$ind_nomina_ult1)] <- 0
+data$ind_nom_pens_ult1[is.na(data$ind_nom_pens_ult1)] <- 0
+data$tiprel_1mes <- as.character(data$tiprel_1mes)
+data$tiprel_1mes[is.na(data$tiprel_1mes)] <- "A"
+data$segmento <- as.character(data$segmento)
+data$segmento[is.na(data$segmento)] <- "UNKNOWN"
+
+test_data$nomprov <- as.character(test_data$nomprov)
+test_data$nomprov[is.na(test_data$nomprov)] <- "UNKNOWN"
+test_data$canal_entrada <- as.character(test_data$canal_entrada)
+test_data$canal_entrada[is.na(test_data$canal_entrada)] <- "UNKNOWN"
+test_data$sexo <- as.character(test_data$sexo)
+test_data$sexo[is.na(test_data$sexo)] <- "UNKNOWN"
+test_data$tiprel_1mes <- as.character(test_data$tiprel_1mes)
+test_data$tiprel_1mes[is.na(test_data$tiprel_1mes)] <- "A"
+test_data$segmento <- as.character(test_data$segmento)
+test_data$segmento[is.na(test_data$segmento)] <- "UNKNOWN"
+
+all_cols <- colnames(data)
+user_cols <- colnames(data[ ! all_cols %in% prod_cols])
+data$tiprel_1mes <- as.factor(data$tiprel_1mes)
+data$sexo <- as.factor(data$sexo)
+data$canal_entrada <- as.factor(data$canal_entrada)
+data$segmento <- as.factor(data$segmento)
+data$nomprov <- as.factor(data$nomprov)
+
+all_cols <- colnames(test_data)
+user_cols <- colnames(test_data[ ! all_cols %in% prod_cols])
+test_data$tiprel_1mes <- as.factor(test_data$tiprel_1mes)
+test_data$sexo <- as.factor(test_data$sexo)
+test_data$canal_entrada <- as.factor(test_data$canal_entrada)
+test_data$segmento <- as.factor(test_data$segmento)
+test_data$nomprov <- as.factor(test_data$nomprov)
+```
+
+The distribution of the column "age" is shown below. We can see that the distribution is bimodal with a lot of values around 25 and 50. It also has some values that do not make logical sense like people below the age of 18 and above the age of 100. These values are sanitized to replace the values below 18 with the median age between 18 and 30 and the values above 100 with the median age between 50 and 100.
+```{r}
+ggplot(data=data,aes(x=age)) +
+  geom_bar(alpha=0.75,fill="tomato",color="black") +
+  xlim(c(18,100)) +
+  ggtitle("Age Distribution") +
+  my_theme
+
+data$age[(data$age < 18)] <- median(data$age[(data$age >= 18) & (data$age <=30)])
+data$age[(data$age > 100)] <- median(data$age[(data$age >= 30) & (data$age <=100)])
+
+test_data$age[(test_data$age < 18)] <- median(test_data$age[(test_data$age >= 18) & (test_data$age <=30)])
+test_data$age[(test_data$age > 100)] <- median(test_data$age[(test_data$age >= 30) & (test_data$age <=100)])
+```
+
+
+Missing values for the column "renta" (Income) are imputed by examining the income distribution per city and imputing the median income of the city the customer belongs to.
+
+```{r}
+data %>%
+  filter(!is.na(renta)) %>%
+  group_by(nomprov) %>%
+  summarise(med.income = median(renta)) %>%
+  arrange(med.income) %>%
+  mutate(city=factor(nomprov,levels=nomprov)) %>%
+  ggplot(aes(x=city,y=med.income)) +
+  geom_point(color="blue") +
+  guides(color=FALSE) +
+  xlab("City") +
+  ylab("Median Income") +
+  my_theme +
+  theme(axis.text.x=element_blank(), axis.ticks = element_blank()) +
+  geom_text(aes(x=city,y=med.income,label=city),angle=90,hjust=-.25) +
+  theme(plot.background=element_rect(),
+        panel.grid =element_blank(),
+        axis.title =element_text(color="blue"),
+        axis.text  =element_text(color="blue"),
+        plot.title =element_text(color="blue")) +
+  ylim(c(60000,180000)) +
+  ggtitle("Income Distribution by City")
+
+new.incomes <-data %>% select(nomprov) %>%
+                       merge(data %>% group_by(nomprov) %>%
+                            summarise(med.income=median(renta,na.rm=TRUE)),by="nomprov") %>%
+                       select(nomprov,med.income) %>%
+                       arrange(nomprov)
+data <- arrange(data,nomprov)
+data$renta[is.na(data$renta)] <- new.incomes$med.income[is.na(data$renta)]
+ 
+data$renta[is.na(data$renta)] <- median(data$renta,na.rm=TRUE)
+
+
+test_data$renta <- as.numeric(test_data$renta)
+
+new.incomes <-test_data %>% select(nomprov) %>%
+                       merge(test_data %>% group_by(nomprov) %>%
+                            summarise(med.income=median(renta,na.rm=TRUE)),by="nomprov") %>%
+                       select(nomprov,med.income) %>%
+                       arrange(nomprov)
+test_data <- arrange(test_data,nomprov)
+test_data$renta[is.na(test_data$renta)] <- new.incomes$med.income[is.na(test_data$renta)]
+ 
+test_data$renta[is.na(test_data$renta)] <- median(test_data$renta,na.rm=TRUE)
+
+```
+
+5. Data Sanitization
+Sanitizing Character columns. Checking if any character columns have empty strings. Looks like we are good.
+```{r}
+char.cols <- names(data)[sapply(data,is.character)]
+for (name in char.cols){
+  print(sprintf("Unique values for %s:", name))
+  print(unique(data[[name]]))
+  cat('\n')
+}
+
+
+
+char.cols <- names(test_data)[sapply(test_data,is.character)]
+for (name in char.cols){
+  print(sprintf("Unique values for %s:", name))
+  print(unique(test_data[[name]]))
+  cat('\n')
+  }
+```
+Converting all fearures into numeric variables
+
+```{r}
+data[,prod_cols]     <- lapply(data[,prod_cols],function(x)as.integer(round(x)))
+
+```
+
+Some measures are performed to reduce the categorical values for "nomprov" (Province Name), "pais_residencia" (Country of Residence) and "canal_entrada" (Channel of Entry). There are 53 different provinces and 50% of the customers come from Madrid, Barcelona and Valencia. Therefore, I assign the province name for the remaining customers as 'Other'. Similarly, there are 66 different nationalities and 97% of the customers come from Spain. Therefore, I assign the country to residence for the remaining customers as 'Other'. Also, there are 143 different channels of entry and 70% of the customers come via 'KHE', ''KAT' and 'KFC'. Therefore, I assign the channel of entry for the remaining customers as 'Other'.
+
+
+```{r}
+unique_countries <- length(unique(data$pais_residencia))
+top_10_countries <- data %>%
+  group_by(pais_residencia) %>%
+  summarise(count_by_countries=n())  %>%
+  select(pais_residencia,count_by_countries) %>% arrange(-count_by_countries) %>% head(10)
+#kable(top_10_countries)
+data$pais_residencia <- as.character(data$pais_residencia)
+data$countries <- ifelse(data$pais_residencia %in% c('ES'), data$pais_residencia,'Other')
+
+unique_countries <- length(unique(test_data$pais_residencia))
+top_10_countries <- test_data %>%
+  group_by(pais_residencia) %>%
+  summarise(count_by_countries=n())  %>%
+  select(pais_residencia,count_by_countries) %>% arrange(-count_by_countries) %>% head(10)
+test_data$pais_residencia <- as.character(test_data$pais_residencia)
+
+
+
+unique_channels <- length(unique(data$canal_entrada))
+top_10_channels <- data %>%
+  group_by(canal_entrada) %>%
+  summarise(count_by_channels=n())  %>%
+  select(canal_entrada,count_by_channels) %>% arrange(-count_by_channels) %>% head(10)
+#kable(top_10_channels)
+data$canal_entrada <- as.character(data$canal_entrada)
+data$channel <- ifelse(data$canal_entrada %in% c('KHE', 'KAT', 'KFC','UNKNOWN'), data$canal_entrada,'Other')
+
+unique_channels <- length(unique(test_data$canal_entrada))
+top_10_channels <- test_data %>%
+  group_by(canal_entrada) %>%
+  summarise(count_by_channels=n())  %>%
+  select(canal_entrada,count_by_channels) %>% arrange(-count_by_channels) %>% head(10)
+test_data$canal_entrada <- as.character(test_data$canal_entrada)
+test_data$channel <- ifelse(test_data$canal_entrada %in% c('KHE', 'KAT', 'KFC','UNKNOWN'), test_data$canal_entrada,'Other')
+
+unique_provinces <- length(unique(data$nomprov))
+top_10_provinces <- data %>%
+  group_by(nomprov) %>%
+  summarise(count_by_provinces=n())  %>%
+  select(nomprov,count_by_provinces) %>% arrange(-count_by_provinces) %>% head(10)
+#kable(top_10_provinces)
+data$nomprov <- as.character(data$nomprov)
+data$provinces <- ifelse(data$nomprov %in% c('MADRID', 'BARCELONA', 'VALENCIA'), data$nomprov,'Other')
+
+unique_provinces <- length(unique(test_data$nomprov))
+top_10_provinces <- test_data %>%
+  group_by(nomprov) %>%
+  summarise(count_by_provinces=n())  %>%
+  select(nomprov,count_by_provinces) %>% arrange(-count_by_provinces) %>% head(10)
+test_data$nomprov <- as.character(test_data$nomprov)
+test_data$provinces <- ifelse(test_data$nomprov %in% c('MADRID', 'BARCELONA', 'VALENCIA'), test_data$nomprov,'Other')
+
+```
+
+
+## Exploratory Data Analysis -
+
+1.	Analysis of Customer Initiation into the Bank by Month
+We can see that there is a significant rise in July that remains until Autumn and the most number of holders are between September and October. this might be because July is the first month in Spain with vacations, and the academic calendar starts in September-October and is considered like a "new year" when people very prone to doing new things like opening a new bank account.
+
+```{r}
+data <- as.data.table(data)
+ggplot(data[year_alta>2009,.N, by =.(month_alta,year_alta)],aes(x = month_alta,y=N,fill=month_alta))+
+  geom_bar(stat="identity")+ggtitle("Number of customers that became 'first holder' by month and year")+
+  facet_wrap(~year_alta)
+```
+
+2.	Analysis of Customer Age, Segments, Channel of Entry and Household Income
+    As can be seen from the plot, college graduates are young people whereas VIP and Individuals are middle aged        which seems logical and expected.
+    
+    ```{r}
+age_segmento <- ggplot(data, aes(x=age)) + 
+  geom_bar(
+    aes(fill=segmento)
+  ) + 
+  labs(title="Customer Age and Segmentation") +
+  labs(x="Age", y="Number of Customers") +
+  scale_fill_discrete(name = "Segmentation",
+                      labels = c("01 - VIP", "02 - Individuals","03 - College Graduated","04 - Unnoted"))+
+  my_theme
+age_segmento
+```
+
+The plot of household incomes by segments also aligns with realistic expectations. VIP customers have the highest income, then individuals and towards the end, graduates.
+
+
+```{r}
+income_segment <- ggplot(data, aes(renta)) + 
+  geom_histogram(breaks=seq(1203, 155500*3, by = 2000), 
+                 aes(fill=segmento)) + 
+  labs(title="Histogram for Gross income of the household by Segment") +
+  labs(x="Gross income of the household", y="Count")  +
+  my_theme
+income_segment
+```
+
+It can be inferred from the plot of customer age and channel of entry that the channel of entry "KHE" was mostly used by young university goers.
+
+```{r}
+age_channel <- ggplot(data, aes(x=age))+  geom_bar(aes(fill=channel))+ xlab("Age") + ylab("Number of Customers")+ ggtitle("Customer Age and Channel") + my_theme + scale_x_discrete(limit = c(0,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100))
+age_channel
+```
+
+It can be seen from the plot of customer household income and channel of entry that the channel of entry is correlated with the gross household income. Customers with highest income have entered via the KAT channel whereas the customers entering via the channel KHE (university goers) have incomes lesser than those entering via KFC and KAT (mostly middle aged people belonging to the "Individuals and Top" classes). Thus, entry of channel, household income, age and segments seem strongly correlated. 
+
+```{r}
+income_channel <- ggplot(data, aes(renta)) + geom_histogram(breaks=seq(1203, 155500*3, by = 2000), 
+                 #col="red", 
+                 aes(fill=channel)) + 
+  labs(title="Histogram for Gross income of the household by Channel") +
+  labs(x="Gross income of the household", y="Count") +
+  my_theme
+income_channel
+```
+
+3. Analysis of the Popularity of Products
+
+The bar chart below shows the number of customers that own a product. This gives us an indication of product popularity among customers. We can see that the product "ind_cco_fin_ult1" (Current Accounts) has highest customer ownership (>50%) followed by the products "ind_ctop_fin_ult1" (Particular Account) and "ind_recibo_ult1" (Direct Debit). 
+
+```{r}
+product_popularity_plot <- data %>% select(ind_ahor_fin_ult1:ind_recibo_ult1) %>% summarise_each(funs(sum)) %>% gather(product, frequency, ind_ahor_fin_ult1:ind_recibo_ult1) %>% ggplot(aes(x = reorder(product,frequency), y = frequency)) + geom_bar(stat="identity", position="dodge", fill="blue") + labs(y = "Product Ownership Frequency", x = "Product") + my_theme + geom_text(aes(label = frequency), position=position_dodge(width=1.5))+ coord_flip()
+product_popularity_plot
+```
+
+Plot of Product Popularity by Segments
+
+
+```{r}
+product_popularity_per_segment <- data %>% group_by(segmento) %>% select(segmento:ind_recibo_ult1) %>% summarise_each(funs(sum)) %>% gather(product, frequency, ind_ahor_fin_ult1:ind_recibo_ult1) %>%  ggplot(aes(x = product, y = frequency)) + geom_bar(stat="identity", position="dodge", aes(fill=segmento)) + labs(y = "Product Ownership Frequency", x = "Product") + my_theme + facet_wrap(~segmento) + theme(strip.text.x = element_text(size = 8, colour = "black")) + coord_flip()
+product_popularity_per_segment
+```
+
+```{r}
+segments_per_product <- data %>% group_by(segmento) %>% select(segmento:ind_recibo_ult1) %>% summarise_each(funs(sum)) %>% gather(product, frequency, ind_ahor_fin_ult1:ind_recibo_ult1) %>%  ggplot(aes(x = segmento, y = frequency)) + geom_bar(stat="identity", position="dodge", aes(fill=segmento)) + labs(y = "Product Ownership Frequency", x = "Segment") + my_theme + facet_wrap(~product) + theme(strip.text.x = element_text(size = 8, colour = "black")) + coord_flip()
+segments_per_product
+
+```
+
+It is clear that the Current Accounts product is the most popular amounts University Students and the Particulars groups (both of which have a gross household income of below average and average). In the Top income bracket group, the products e-account, long-term deposits and direct debit are also popular along with current account. This is logical since this group has more capital to invest at their disposal. The direct debit, payroll and particular products are also popular with the Particulars group which falls in the middle-income bracket (maybe working class). The short-term deposits product is also particularly popular with the Particulars group.
+
+Product popularity by Sex
+```{r}
+product_popularity_per_sex <- data[sexo!="UNKNOWN",] %>% group_by(sexo) %>% select(sexo, ind_ahor_fin_ult1:ind_recibo_ult1) %>% summarise_each(funs(sum)) %>% gather(product, frequency, ind_ahor_fin_ult1:ind_recibo_ult1) %>%  ggplot(aes(x = product, y = frequency)) + geom_bar(stat="identity", position="dodge", aes(fill=sexo)) + labs(y = "Product Ownership Frequency", x = "Product") + my_theme + facet_wrap(~sexo) + theme(strip.text.x = element_text(size = 8, colour = "black")) + coord_flip()
+product_popularity_per_sex
+```
+
+```{r}
+sex_per_product <- data[sexo!="UNKNOWN",] %>% group_by(sexo) %>% select(sexo, ind_ahor_fin_ult1:ind_recibo_ult1) %>% summarise_each(funs(sum)) %>% gather(product, frequency, ind_ahor_fin_ult1:ind_recibo_ult1) %>%  ggplot(aes(x = sexo, y = frequency)) + geom_bar(stat="identity", position="dodge", aes(fill=sexo)) + labs(y = "Product Ownership Frequency", x = "Sex") + my_theme + facet_wrap(~product) + theme(strip.text.x = element_text(size = 8, colour = "black")) + coord_flip()
+sex_per_product
+```
+There is no significant difference between the products owned by males and females. The proportion of males is higher in the dataset and that is reflected in the plots.  
+
+
+## Association Rule Mining and Market Basket Analysis of Products
+Association mining is commonly used to make product recommendations by identifying products that are frequently bought together. The Apriori algorithm is used to generate the most relevant set of rules from a given transaction data set. A rule is a notation that represents which items are frequently bought together. Support, Confidence and Lift are three measures that are used to decide the relative strengths of the rules. 
+Consider, the rule A => B, 
+Support  = (Number of Transactions with both A and B)/(Total Number of Transactions) , Confidence  = (Number of Transactions with both A and B)/(Total Number of Transactions with A)
+
+Expected Confidence  = (Number of Transactions with B)/(Total Number of Transactions) ,  Lift  = Confidence/(Expected Confidence)
+
+Lift is a factor by which the co-occurrence of A and B exceeds the probability of A and B co-occurring had they been independent. So, higher the lift, higher the chances of A and B occurring together.
+
+Using a support argument of 5% and a confidence argument of 80%, the Apriori algorithms generates the following rules for our dataset. A confidence of 1 implies that whenever an LHS item was purchased, the RHS item was purchased 100% of the time. A rule with a lift of 13.5 indicates that the items in LHS and RHS are 13.5 times more likely to be purchased together compared to the purchases when they are assumed to be independent.
+
+```{r}
+mb_data <- data %>% select(ncodpers,ind_ahor_fin_ult1:ind_recibo_ult1) %>% gather(product,ownership,ind_ahor_fin_ult1:ind_recibo_ult1)
+mb_data <- mb_data[mb_data$ownership==1,]
+mb_data$ownership = NULL
+mb_data_transactions <- split(mb_data$product, mb_data$ncodpers)
+lapply(mb_data_transactions, write, "market_basket_data.txt", append=TRUE, ncolumns=25)
+mb_data_transactions <- read.transactions("market_basket_data.txt", sep=" ")
+
+itemFrequencyPlot(mb_data_transactions, topN=10, type="absolute", main="Item Frequency")
+frequentProducts <- eclat (mb_data_transactions, parameter = list(supp = 0.05, maxlen = 15))
+
+rules <- apriori (mb_data_transactions, parameter = list(supp = 0.05, conf = 0.8)) 
+rules_conf <- sort (rules, by="confidence", decreasing=TRUE)
+rules_lift <- sort(rules, by="lift", decreasing=TRUE)
+
+#Remove Redundant Rules
+subsetRules <- which(colSums(is.subset(rules, rules)) > 1) # get subset rules in vector
+rules <- rules[-subsetRules] # remove subset rules
+```
+Frequent Items -
+```{r}
+#kable(inspect(frequentProducts))
+
+```
+
+Association Rules sorted by Confidence
+```{r}
+#kable(inspect(rules_conf))
+
+```
+
+
+Association Rules sorted by Lift
+```{r}
+#kable(inspect(rules_lift))
+
+```
+
+
+We can infer that, the product combinations of {Payroll, Pensions}, {Payroll Account + Payroll , Pensions} and {Payroll + Direct Debit , Pensions}  have always been bought together. From the association rules, it is clear that the Payroll, Payroll Account, Pensions, Direct Debit and Current accounts products are most likely to be purchased together.
+
+
+## Modeling and Performance Evaluation
+
+The methods for multi-label classification can be grouped into two main categories (Ref: Multi Label Classification - An Overview) - 
+a)	Problem Transformation Methods - Methods that transform the multi-label transformation problem into one or more single-label classification problems
+b)	Algorithm Adaptation Methods - Methods that extend specific learning algorithms in order to handle multi-label data directly
+
+Evaluation Metrics for Multi Label Classification Problems -
+a)	Hamming Loss - Hamming Loss measures how many times on average, the relevance of an example to a class label is incorrectly predicted. It takes into account the prediction error(an incorrect label predicted) and the missing error(a relevant label not predicted), normalized over total number of classes and total number of examples.
+
+b)	Accuracy - Accuracy for each instance is defined as the proportion of the predicted correct labels to the total number (predicted and true) of labels for that instance. Overall Accuracy is the average across all instances.
+
+c)	Precision - Precision is the proportion of predicted correct labels to the total number of actual labels averaged over all instances.
+
+d)	Recall - Recall is the proportion of predicted correct labels to the total number of predicted labels averaged across all instances.
+
+e)	F1-Measure - F1 measure is nothing but the harmonic mean of precision and recall.
+
+As in single label classification task, the higher the value of accuracy, precision, recall and F-1 score, the better the performance of the learning algorithm.
+
+This analysis considers one Problem Transformation Method - The Binary Relevance Method and two Algorithm Adaptation Methods - Random Forests and Neural Networks.
+
+
+```{r}
+labels = colnames(data)[17:40]
+data <- as.data.frame(data)
+data[,17:40] <- apply(as.matrix(data[,17:40]),2, function(x) as.logical(x));
+model_data <- data[,c(-1,-3,-6,-12,-13)]
+model_data$ind_empleado <- as.factor(model_data$ind_empleado)
+model_data$indresi <- as.factor(model_data$indresi)
+model_data$provinces <- as.factor(model_data$provinces)
+model_data$channel <- as.factor(model_data$channel)
+model_data$countries <- as.factor(model_data$countries)
+
+mysample <- sample(1:nrow(model_data),0.7*nrow(model_data))
+train_data <- model_data[mysample,]
+test_data <- model_data[-mysample,]
+
+train_data_rfsrc <- train_data
+train_data_rfsrc$month_alta <- factor(train_data_rfsrc$month_alta, ordered = FALSE)
+train_data_rfsrc_sample <- sample(1:nrow(train_data_rfsrc),0.3*nrow(train_data_rfsrc))
+train_data_rfsrc <- train_data_rfsrc[train_data_rfsrc_sample,]
+test_data_rfsrc <- train_data_rfsrc[-train_data_rfsrc_sample,]
+test_data_rfsrc <- test_data_rfsrc[sample(1:nrow(test_data_rfsrc),0.5*nrow(test_data_rfsrc)),]
+
+products_task_train_rfsrc = makeMultilabelTask(id = "products_rfsrc", data = train_data_rfsrc, target = labels)
+products_task_train = makeMultilabelTask(id = "products", data = train_data, target = labels)
+```
+
+### Binary Relevance Problem Transformation Method
+
+The binary relevance problem transformation method converts the multilabel problem to binary classification problems for each label and applies a simple binary classifier on these. To classify a new instance, this method outputs as a set of labels the union of labels that are output by each simple binary classifier. 
+This binary classifier can be any of the widely-used classifiers - K-NN, Naïve Bayes, Decision Trees, Random Forests, Logistic Regression etc. In this analysis, we use the Classification RPART (Recursive Partitioning and Regression Trees). 
+The package "mlr" has an implementation of the Binary Relevance technique. 
+
+```{r}
+#Constructing the Learner
+learn_br_prob = makeLearner("classif.rpart", predict.type = "prob") 
+learn_br_prob = makeMultilabelBinaryRelevanceWrapper(learn_br_prob)
+
+#Model Training
+br_model = train(learn_br_prob, products_task_train)
+
+#Model Prediction
+br_model_pred = predict(br_model, task = products_task_train)
+br_model_pred_test = predict(br_model, newdata=test_data)
+
+#Model Performance
+br_model_perf <- performance(br_model_pred, measures = list(multilabel.subset01, multilabel.hamloss, multilabel.acc, multilabel.f1, timepredict))
+br_model_perf_test <- performance(br_model_pred_test, measures = list(multilabel.subset01, multilabel.hamloss, multilabel.acc, multilabel.f1, timepredict))
+```
+
+### Random Forests Algorithm Adapatation Method
+
+The Random Forests Algorithm Adaptation method extends the implementation of Random Forests to accommodate multi-label classification task. For this task, the definition of entropy is modified. In addition to this, multiple labels are allowed in the leaves of the tree.
+The package "randomForestSRC" has a similar implementation and is used for this analysis.
+
+```{r}
+#Constructing the Learner
+lrn.rfsrc = makeLearner("multilabel.randomForestSRC")
+
+#Model Training
+rfsrc_model = train(lrn.rfsrc,products_task_train_rfsrc)
+rfsrc_model
+
+#Model Prediction
+rfsrc_model_pred = predict(rfsrc_model, task=products_task_train_rfsrc)
+rfsrc_model_pred_test = predict(rfsrc_model, newdata=test_data_rfsrc)
+
+#Model Performance
+rfsrc_model_perf <- performance(rfsrc_model_pred, measures = list(multilabel.subset01, multilabel.hamloss, multilabel.acc, multilabel.f1, timepredict))
+rfsrc_model_perf_test <- performance(rfsrc_model_pred_test, measures = list(multilabel.subset01, multilabel.hamloss, multilabel.acc, multilabel.f1, timepredict))
+
+```
+
+
+10-fold Crossvalidation Results -
+
+```{r}
+
+k <- 10
+outs_br <- NULL
+outs_rfsrc <- NULL
+proportion <- 0.90 
+
+for(i in 1:k)
+{
+    index <- sample(1:nrow(train_data), round(proportion*nrow(train_data)))
+    products_task_train = makeMultilabelTask(id = "products_train", data = train_data[index,], target = labels)
+    products_task_test = makeMultilabelTask(id = "products_test", data = train_data[-index,], target = labels)
+    
+    index_rfsrc <- sample(1:nrow(train_data_rfsrc), round(proportion*nrow(train_data_rfsrc)))
+    products_task_train_rfsrc = makeMultilabelTask(id = "products_rfsrc", data = train_data_rfsrc[index_rfsrc,], target = labels)
+    products_task_test_rfsrc = makeMultilabelTask(id = "products_rfsrc", data = train_data_rfsrc[-index_rfsrc,], target = labels)
+
+    br_model = train(learn_br_prob, products_task_train)
+    br_model_pred = predict(br_model, newdata=train_data[-index,])
+    br_model_perf <- performance(br_model_pred, measures = multilabel.acc)
+    br_model_perf <- as.data.frame(br_model_perf)
+    outs_br[i] <- br_model_perf[1,1]
+   
+    rfsrc_model = train(lrn.rfsrc, products_task_train_rfsrc)
+    rfsrc_model_pred = predict(rfsrc_model, newdata=train_data_rfsrc[-index_rfsrc,])
+    rfsrc_model_perf <- performance(rfsrc_model_pred, measures = multilabel.acc)
+    rfsrc_model_perf <- as.data.frame(rfsrc_model_perf)
+    outs_rfsrc[i] <- rfsrc_model_perf[1,1]
+}
+
+
+cv_10_fold_br <- mean(outs_br)
+cv_10_fold_rfsrc <- mean(outs_rfsrc)
+
+
+#Resampling via Cross Validation
+resample_desc = makeResampleDesc(method = "CV", stratify = FALSE, iters = 10)
+
+resample_br = resample(learner = learn_br_prob, task = products_task_train, resampling = resample_desc, show.info = FALSE)
+
+resample_rfsrc = resample(learner = lrn.rfsrc, task = products_task_train, resampling = resample_desc, show.info = FALSE)
+
+#Binary Classifier Performance
+kable(getMultilabelBinaryPerformances(br_model_pred, measures = list(acc, mmce, auc)))
+kable(getMultilabelBinaryPerformances(rfsrc_model_pred, measures = list(acc, mmce)))
+
+```
+
+### Neural Networks Algorithm Adaptation Method
+
+The BPMLL Algorithm - Back Propagation Multi Label Learner with multiple outputs is an implementation of neural networks in the multi label classification space. The package "neuralnet" in R is used for this analysis. The activation function is set to Logistic. 
+
+```{r}
+model_data_nn <- model_data
+model_data_nn[,12:35] <- apply(model_data[,12:35], 2, function(x) as.numeric(x));
+model_data_nn$segmento <- as.character(model_data_nn$segmento)
+model_data_nn[model_data_nn$segmento == "02 - PARTICULARES", "segmento"] <- "PARTICULARES"
+model_data_nn[model_data_nn$segmento == "03 - UNIVERSITARIO", "segmento"] <- "UNIVERSITARIO"
+model_data_nn[model_data_nn$segmento == "01 - TOP", "segmento"] <- "TOP"
+col_names <- names(model_data_nn)
+formula <- as.formula(paste(paste(labels, collapse="+"),"~", paste(col_names[!col_names %in% labels], collapse = " + ")))
+
+m <- model.matrix(~ind_ahor_fin_ult1 + ind_aval_fin_ult1 + ind_cco_fin_ult1 + ind_cder_fin_ult1 + 
+                      ind_cno_fin_ult1 + ind_ctju_fin_ult1 + ind_ctma_fin_ult1 + 
+                      ind_ctop_fin_ult1 + ind_ctpp_fin_ult1 + ind_deco_fin_ult1 + 
+                      ind_deme_fin_ult1 + ind_dela_fin_ult1 + ind_ecue_fin_ult1 + 
+                      ind_fond_fin_ult1 + ind_hip_fin_ult1 + ind_plan_fin_ult1 + 
+                      ind_pres_fin_ult1 + ind_reca_fin_ult1 + ind_tjcr_fin_ult1 + 
+                      ind_valo_fin_ult1 + ind_viv_fin_ult1 + ind_nomina_ult1 + 
+                      ind_nom_pens_ult1 + ind_recibo_ult1 + ind_empleado + sexo + 
+                      age + ind_nuevo + antiguedad + indrel + tiprel_1mes + indresi + 
+                      ind_actividad_cliente + renta + segmento + provinces + countries + 
+                      channel, data=model_data_nn)
+m <- as.data.frame(m)
+m <- m[,c(-1)]
+col_names <- names(m)
+formula <- as.formula(paste(paste(labels, collapse="+"),"~", paste(col_names[!col_names %in% labels], collapse = " + ")))
+
+train_data_nn <- m[mysample,]
+test_data_nn <- m[-mysample,]
+
+neural_net <- neuralnet(formula,
+                data = train_data_nn,
+                act.fct = "logistic",
+                linear.output = FALSE,
+                lifesign = "minimal")
+plot(neural_net)
+#Compute Predictions
+neural_net_predict <- compute(neural_net, train_data_nn[,25:49])
+neural_net_predict_test <- compute(neural_net, test_data_nn[,25:49])
+
+
+#Extract Results
+neural_net_predictions <- neural_net_predict$net.result
+neural_net_predictions <- apply(neural_net_predictions,2,function(x) round(x))
+head(neural_net_predictions)
+
+neural_net_predictions_test <- neural_net_predict_test$net.result
+neural_net_predictions_test <- apply(neural_net_predictions_test,2,function(x) round(x))
+
+# Accuracy (training set)
+original_values <- train_data_nn[, 1:24]
+row_match <- as.array(seq(from=0,to=0,length.out=dim(train_data_nn)[1]))
+row_mismatch <- as.array(seq(from=0,to=0,length.out=dim(train_data_nn)[1]))
+
+for(i in 1:dim(neural_net_predictions)[1])
+  {for(j in 1:dim(neural_net_predictions)[2])
+  {
+    if(neural_net_predictions[i,j]==original_values[i,j]){ row_match[i]=row_match[i]+1}
+    else {row_mismatch[i]=row_mismatch[i]+1}
+  }
+}
+nnet_perf_train <- mean((row_match-row_mismatch)/24)
+
+# Accuracy (test set)
+original_values <- test_data_nn[, 1:24]
+row_match <- as.array(seq(from=0,to=0,length.out=dim(test_data_nn)[1]))
+row_mismatch <- as.array(seq(from=0,to=0,length.out=dim(test_data_nn)[1]))
+
+for(i in 1:dim(neural_net_predictions_test)[1])
+  {for(j in 1:dim(neural_net_predictions_test)[2])
+  {
+    if(neural_net_predictions_test[i,j]==original_values[i,j]){ row_match[i]=row_match[i]+1}
+    else {row_mismatch[i]=row_mismatch[i]+1}
+  }
+}
+nnet_perf_test <- mean((row_match-row_mismatch)/24)
+
+
+#Cross Validation
+k <- 10
+# Results from cv
+outs <- NULL
+# Train test split proportions
+proportion <- 0.90 # Set to 0.995 for LOOCV
+
+# Crossvalidate, go!
+for(x in 1:k)
+{
+    index <- sample(1:nrow(train_data_nn), round(proportion*nrow(train_data_nn)))
+    train_cv <- train_data_nn[index, ]
+    test_cv <- train_data_nn[-index, ]
+    nn_cv <- neuralnet(formula,
+                        data = train_cv,
+                        act.fct = "logistic",
+                        linear.output = FALSE)
+    
+    # Compute predictions
+    pr.nn <- compute(nn_cv, test_cv[, 25:49])
+    # Extract results
+    pr.nn_ <- pr.nn$net.result
+    pr.nn_ <- apply(pr.nn_,2,function(x) round(x))
+    # Accuracy (test set)
+    original_values <- test_cv[, 1:24]
+    row_match <- as.array(seq(from=0,to=0,length.out=dim(test_cv)[1]))
+    row_mismatch <- as.array(seq(from=0,to=0,length.out=dim(test_cv)[1]))
+
+for(i in 1:dim(pr.nn_)[1])
+  {for(j in 1:dim(pr.nn_)[2])
+  {
+    if(pr.nn_[i,j]==original_values[i,j]){ row_match[i]=row_match[i]+1}
+    else {row_mismatch[i]=row_mismatch[i]+1}
+  }
+}
+    outs[x] <- mean((row_match-row_mismatch)/24)
+}
+
+cv_10_fold_nnet <- mean(outs)
+```
+
+```{r}
+#Binary Relevance Performance
+kable(br_model_perf)
+kable(br_model_perf_test)
+
+#Random Forests Performance
+kable(rfsrc_model_perf)
+kable(rfsrc_model_perf_test)
+
+#Neural Net Accuracy
+kable(nnet_perf_train)
+kable(nnet_perf_test)
+
+#Cross Validation Training errors
+kable(cv_10_fold_br)
+kable(resample_br)
+
+kable(cv_10_fold_rfsrc)
+kable(resample_rfsrc)
+
+kable(cv_10_fold_nnet)
+
+```
+
+## Conclusion
+
+So, we can see that the performance of the Random Forests Algorithm Adaptation Technique is the best and that of the Binary Relevance Problem Transformation Method is the worst (slightly better than a random classifier) in this analysis. The Neural Network Algorithm Adaptation Technique performs well too. The performance of the learners is comparable in both the test and training data which shows that the techniques are robust and are not prone to overfitting.
+
+
+
+
